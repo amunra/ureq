@@ -6,6 +6,7 @@ use std::ops::Div;
 use std::time::Duration;
 use std::time::Instant;
 use std::{fmt, io::Cursor};
+use std::fmt::Formatter;
 
 #[cfg(feature = "socks-proxy")]
 use socks::{TargetAddr, ToTargetAddr};
@@ -17,6 +18,63 @@ use crate::proxy::Proxy;
 use crate::unit::Unit;
 use crate::Response;
 use crate::{error::Error, proxy::Proto};
+
+/// Trait for an abstract connection stream, implementing [std::io::Read] + [std::io::Write].
+/// Used in [StreamConnector].
+pub trait StreamConnection : Read + Write + Send + Sync + fmt::Debug + 'static {
+    /// Set the timeout on the next read operation.
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+
+    /// Set the timeout on the next write operation.
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+
+    /// A description representing the final endpoint connection.
+    ///
+    /// If the connection is wrapped in TLS or retry layers,
+    /// this should be the final connection layer.
+    /// In many cases it should be sufficient to return `&self`.
+    fn conn_description(&self) -> &dyn fmt::Debug;
+
+    /// Return true if connection was closed.
+    ///
+    /// This check is generally implemented by performing a non-blocking read
+    /// and interpreting an EOF value as indication of a closed connection.
+    fn check_conn_closed(&self) -> io::Result<bool>;
+}
+
+/// Check if the TCP connection is still open.
+/// Check by performing a one-byte non-blocking read.
+/// If this returns EOF, the server has closed the connection: return true.
+/// If this returns a successful read, there are some bytes on the connection
+/// even though there was no inflight request.
+/// For plain HTTP streams, that might mean an HTTP 408 was pushed; it
+/// could also mean a buggy server that sent more bytes than a response's
+/// Content-Length. For HTTPS streams, that might mean a close_notify alert,
+/// which is the proper way to shut down an idle stream.
+/// Either way, bytes available on the stream before we've made a request
+/// means the stream is not usable, so we should discard it.
+/// If this returns WouldBlock (aka EAGAIN),
+/// that means the connection is still open: return false. Otherwise
+/// return an error.
+fn check_tcp_conn_closed(stream: &TcpStream) -> io::Result<bool> {
+    let mut buf = [0; 1];
+    stream.set_nonblocking(true)?;
+
+    let result = match stream.peek(&mut buf) {
+        Ok(n) => {
+            debug!(
+                    "peek on reused connection returned {}, not WouldBlock; discarding",
+                    n
+                );
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) => Err(e),
+    };
+    stream.set_nonblocking(true)?;
+
+    result
+}
 
 /// Trait for things implementing [std::io::Read] + [std::io::Write]. Used in [TlsConnector].
 pub trait ReadWrite: Read + Write + Send + Sync + fmt::Debug + 'static {
@@ -38,7 +96,10 @@ pub trait TlsConnector: Send + Sync {
 }
 
 pub(crate) struct Stream {
-    inner: BufReader<Box<dyn ReadWrite>>,
+    inner: BufReader<Box<dyn StreamConnection>>,
+    /// The local address the stream is connected from.
+    pub(crate) local_addr: SocketAddr,
+
     /// The remote address the stream is connected to.
     pub(crate) remote_addr: SocketAddr,
     pool_returner: PoolReturner,
@@ -47,6 +108,33 @@ pub(crate) struct Stream {
 impl<T: ReadWrite + ?Sized> ReadWrite for Box<T> {
     fn socket(&self) -> Option<&TcpStream> {
         ReadWrite::socket(self.as_ref())
+    }
+}
+
+impl<T: ReadWrite> StreamConnection for T {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self.socket() {
+            Some(sock) => sock.set_read_timeout(dur),
+            None => Ok(())
+        }
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self.socket() {
+            Some(sock) => sock.set_write_timeout(dur),
+            None => Ok(())
+        }
+    }
+
+    fn conn_description(&self) -> &dyn fmt::Debug {
+        match self.socket() {
+            Some(sock) => sock,
+            None => self
+        }
+    }
+
+    fn check_conn_closed(&self) -> io::Result<bool> {
+        self.socket().map_or(Ok(false), |s| check_tcp_conn_closed(s))
     }
 }
 
@@ -83,11 +171,9 @@ impl From<DeadlineStream> for Stream {
 impl BufRead for DeadlineStream {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if let Some(deadline) = self.deadline {
-            let timeout = time_until_deadline(deadline)?;
-            if let Some(socket) = self.stream.socket() {
-                socket.set_read_timeout(Some(timeout))?;
-                socket.set_write_timeout(Some(timeout))?;
-            }
+            let timeout = Some(time_until_deadline(deadline)?);
+            self.stream.set_read_timeout(timeout)?;
+            self.stream.set_write_timeout(timeout)?;
         }
         self.stream.fill_buf().map_err(|e| {
             // On unix-y platforms set_read_timeout and set_write_timeout
@@ -159,7 +245,7 @@ impl Read for ReadOnlyStream {
     }
 }
 
-impl std::io::Write for ReadOnlyStream {
+impl Write for ReadOnlyStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         Ok(buf.len())
     }
@@ -169,29 +255,41 @@ impl std::io::Write for ReadOnlyStream {
     }
 }
 
-impl ReadWrite for ReadOnlyStream {
-    fn socket(&self) -> Option<&std::net::TcpStream> {
-        None
+impl StreamConnection for ReadOnlyStream {
+    fn set_read_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_write_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn conn_description(&self) -> &dyn fmt::Debug {
+        self
+    }
+
+    fn check_conn_closed(&self) -> io::Result<bool> {
+        Ok(self.0.position() >= self.0.get_ref().len() as u64)
     }
 }
 
 impl fmt::Debug for Stream {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.inner.get_ref().socket() {
-            Some(_) => write!(f, "Stream({:?})", self.inner.get_ref()),
-            None => write!(f, "Stream(Test)"),
-        }
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        // TODO: Re-instate `Stream(Test)` where relevant.
+        write!(f, "Stream({:?})", self.inner.get_ref().conn_description())
     }
 }
 
 impl Stream {
     pub(crate) fn new(
-        t: impl ReadWrite,
+        t: impl StreamConnection,
+        local_addr: SocketAddr,
         remote_addr: SocketAddr,
         pool_returner: PoolReturner,
     ) -> Stream {
         Stream::logged_create(Stream {
             inner: BufReader::new(Box::new(t)),
+            local_addr,
             remote_addr,
             pool_returner,
         })
@@ -206,44 +304,9 @@ impl Stream {
         self.inner.buffer()
     }
 
-    // Check if the server has closed a stream by performing a one-byte
-    // non-blocking read. If this returns EOF, the server has closed the
-    // connection: return true. If this returns a successful read, there are
-    // some bytes on the connection even though there was no inflight request.
-    // For plain HTTP streams, that might mean an HTTP 408 was pushed; it
-    // could also mean a buggy server that sent more bytes than a response's
-    // Content-Length. For HTTPS streams, that might mean a close_notify alert,
-    // which is the proper way to shut down an idle stream.
-    // Either way, bytes available on the stream before we've made a request
-    // means the stream is not usable, so we should discard it.
-    // If this returns WouldBlock (aka EAGAIN),
-    // that means the connection is still open: return false. Otherwise
-    // return an error.
-    fn serverclosed_stream(stream: &std::net::TcpStream) -> io::Result<bool> {
-        let mut buf = [0; 1];
-        stream.set_nonblocking(true)?;
-
-        let result = match stream.peek(&mut buf) {
-            Ok(n) => {
-                debug!(
-                    "peek on reused connection returned {}, not WouldBlock; discarding",
-                    n
-                );
-                Ok(true)
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
-            Err(e) => Err(e),
-        };
-        stream.set_nonblocking(false)?;
-
-        result
-    }
     // Return true if the server has closed this connection.
     pub(crate) fn server_closed(&self) -> io::Result<bool> {
-        match self.socket() {
-            Some(socket) => Stream::serverclosed_stream(socket),
-            None => Ok(false),
-        }
+        self.inner.get_ref().check_conn_closed()
     }
 
     pub(crate) fn set_unpoolable(&mut self) {
@@ -260,24 +323,16 @@ impl Stream {
     pub(crate) fn reset(&mut self) -> io::Result<()> {
         // When we are turning this back into a regular, non-deadline Stream,
         // remove any timeouts we set.
-        if let Some(socket) = self.socket() {
-            socket.set_read_timeout(None)?;
-            socket.set_write_timeout(None)?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn socket(&self) -> Option<&TcpStream> {
-        self.inner.get_ref().socket()
+        self.set_read_timeout(None)?;
+        self.set_write_timeout(None)
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        if let Some(socket) = self.socket() {
-            socket.set_read_timeout(timeout)
-        } else {
-            Ok(())
-        }
+        self.inner.get_ref().set_read_timeout(timeout)
+    }
+
+    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.get_ref().set_write_timeout(timeout)
     }
 }
 
@@ -327,19 +382,20 @@ pub(crate) fn connect_http(unit: &Unit, hostname: &str) -> Result<Stream, Error>
     let port = unit.url.port().unwrap_or(80);
     let pool_key = PoolKey::from_parts("http", hostname, port);
     let pool_returner = PoolReturner::new(&unit.agent, pool_key);
-    connect_host(unit, hostname, port).map(|(t, r)| Stream::new(t, r, pool_returner))
+    let (t, l, r) = connect_host(unit, hostname, port)?;
+    Ok(Stream::new(t, l, r, pool_returner))
 }
 
 pub(crate) fn connect_https(unit: &Unit, hostname: &str) -> Result<Stream, Error> {
     let port = unit.url.port().unwrap_or(443);
 
-    let (sock, remote_addr) = connect_host(unit, hostname, port)?;
+    let (sock, local_addr, remote_addr) = connect_host(unit, hostname, port)?;
 
     let tls_conf = &unit.agent.config.tls_config;
     let https_stream = tls_conf.connect(hostname, Box::new(sock))?;
     let pool_key = PoolKey::from_parts("https", hostname, port);
     let pool_returner = PoolReturner::new(&unit.agent, pool_key);
-    Ok(Stream::new(https_stream, remote_addr, pool_returner))
+    Ok(Stream::new(https_stream, local_addr, remote_addr, pool_returner))
 }
 
 /// If successful, returns a `TcpStream` and the remote address it is connected to.
@@ -347,7 +403,7 @@ pub(crate) fn connect_host(
     unit: &Unit,
     hostname: &str,
     port: u16,
-) -> Result<(TcpStream, SocketAddr), Error> {
+) -> Result<(TcpStream, SocketAddr, SocketAddr), Error> {
     let connect_deadline: Option<Instant> =
         if let Some(timeout_connect) = unit.agent.config.timeout_connect {
             Instant::now().checked_add(timeout_connect)
@@ -454,13 +510,15 @@ pub(crate) fn connect_host(
             let s = stream.try_clone()?;
             let pool_key = PoolKey::from_parts(unit.url.scheme(), hostname, port);
             let pool_returner = PoolReturner::new(&unit.agent, pool_key);
-            let s = Stream::new(s, remote_addr, pool_returner);
+            let local_addr = s.local_addr()?;
+            let s = Stream::new(s, local_addr, remote_addr, pool_returner);
             let response = Response::do_from_stream(s, unit.clone())?;
             Proxy::verify_response(&response)?;
         }
     }
 
-    Ok((stream, remote_addr))
+    let local_addr = stream.local_addr()?;
+    Ok((stream, local_addr, remote_addr))
 }
 
 #[cfg(feature = "socks-proxy")]

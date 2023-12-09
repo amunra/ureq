@@ -562,12 +562,8 @@ impl Response {
     ///
     /// assert_eq!(resp.status(), 401);
     pub(crate) fn do_from_stream(stream: Stream, unit: Unit) -> Result<Response, Error> {
+        let local_addr = stream.local_addr;
         let remote_addr = stream.remote_addr;
-
-        let local_addr = match stream.socket() {
-            Some(sock) => sock.local_addr().map_err(Error::from)?,
-            None => std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(127, 0, 0, 1), 0).into(),
-        };
 
         //
         // HTTP/1.1 200 OK\r\n
@@ -747,10 +743,11 @@ impl FromStr for Response {
     /// # }
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let remote_addr = "0.0.0.0:0".parse().unwrap();
+        let placeholder_addr = "0.0.0.0:0".parse().unwrap();
         let stream = Stream::new(
             ReadOnlyStream::new(s.into()),
-            remote_addr,
+            placeholder_addr,
+            placeholder_addr,
             PoolReturner::none(),
         );
         let request_url = "https://example.com".parse().unwrap();
